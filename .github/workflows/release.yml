@@ -48,9 +48,11 @@ jobs:
             echo "release $TAG already exists; delete it first" >&2; exit 1
           fi
           # Draft: invisible to /releases/latest (the in-app updater and landing page) until published.
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Monotape $TAG" \
-            --notes "Unsigned build. Windows: SmartScreen > More info > Run anyway. macOS: right-click > Open." >/dev/null
-          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" --jq ".[] | select(.tag_name==\"$TAG\" and .draft) | .id" | head -n1)
+          # The id comes straight from the create call: a fresh draft isn't in the release list yet.
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$TAG" -F draft=true \
+            -f name="Monotape $TAG" \
+            -f body="Unsigned build. Windows: SmartScreen > More info > Run anyway. macOS: right-click > Open." \
+            --jq .id)
           test -n "$id"
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
 
