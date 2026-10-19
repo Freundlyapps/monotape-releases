@@ -129,7 +129,7 @@ jobs:
           repo: ${{ github.event.repository.name }}
           releaseId: ${{ needs.create-release.outputs.release_id }}
           releaseDraft: true
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.triple }}
 
