@@ -110,10 +110,19 @@ jobs:
       - name: Fetch sidecar binaries (macOS)
         if: runner.os == 'macOS'
         run: node scripts/fetch-binaries.mjs --target ${{ matrix.triple }} --ffmpeg-dir ffmpeg-dir
+      - name: Signing key without stray line breaks
+        # a key pasted from an editor usually ends in a newline, which the decoder rejects
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          k=$(printf '%s' "$KEY" | tr -d '\r\n ')
+          test -n "$k" || { echo "TAURI_SIGNING_PRIVATE_KEY is empty" >&2; exit 1; }
+          echo "::add-mask::$k"
+          echo "TAURI_SIGNING_PRIVATE_KEY=$k" >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           owner: ${{ github.repository_owner }}
