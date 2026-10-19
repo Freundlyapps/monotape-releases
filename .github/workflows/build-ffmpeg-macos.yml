@@ -26,7 +26,7 @@ jobs:
         id: cache
         with:
           path: out
-          key: ffmpeg-${{ env.FFMPEG_VERSION }}-lame${{ env.LAME_VERSION }}-opus${{ env.OPUS_VERSION }}-${{ matrix.triple }}-v1
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-lame${{ env.LAME_VERSION }}-opus${{ env.OPUS_VERSION }}-${{ matrix.triple }}-v2
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -46,11 +46,14 @@ jobs:
           tar xf opus-${OPUS_VERSION}.tar.gz
           (cd opus-${OPUS_VERSION} && CFLAGS="$CFLAGS_ARCH" ./configure --prefix="$PREFIX" --disable-shared --enable-static --disable-doc --disable-extra-programs && make -j4 && make install)
           tar xf ffmpeg-${FFMPEG_VERSION}.tar.xz
+          # --disable-autodetect: the runner has Homebrew X11/xcb that configure would otherwise link
+          # in, and users' Macs don't. Only system frameworks/zlib plus the static lame/opus are allowed.
           cd ffmpeg-${FFMPEG_VERSION}
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PWD/../ff" --arch=${{ matrix.arch }} \
             --extra-cflags="-I$PREFIX/include $CFLAGS_ARCH" --extra-ldflags="-L$PREFIX/lib $CFLAGS_ARCH" \
             --disable-gpl --disable-nonfree --disable-debug --disable-doc --disable-ffplay \
+            --disable-autodetect --enable-zlib --enable-securetransport \
             --enable-libmp3lame --enable-libopus --enable-pic
           make -j4
           cp ffmpeg ffprobe ../../out/
