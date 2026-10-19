@@ -1,0 +1,72 @@
+# Builds an LGPL-only static ffmpeg + ffprobe for macOS from the official source tarball.
+# Output artifacts: ffmpeg-aarch64-apple-darwin, ffmpeg-x86_64-apple-darwin (each holds ffmpeg + ffprobe),
+# consumed by release.yml via `node scripts/fetch-binaries.mjs --target <triple> --ffmpeg-dir <dir>`.
+name: build-ffmpeg-macos
+on:
+  workflow_dispatch:
+  workflow_call:
+env:
+  FFMPEG_VERSION: "8.1.3"
+  FFMPEG_SHA256: "7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3"
+  LAME_VERSION: "3.100"
+  LAME_SHA256: "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e"
+  OPUS_VERSION: "1.5.2"
+  OPUS_SHA256: "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1"
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { triple: aarch64-apple-darwin, runner: macos-14, arch: arm64 }
+          - { triple: x86_64-apple-darwin, runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: out
+          key: ffmpeg-${{ env.FFMPEG_VERSION }}-lame${{ env.LAME_VERSION }}-opus${{ env.OPUS_VERSION }}-${{ matrix.triple }}-v1
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          brew install nasm pkg-config
+          mkdir -p work out && cd work
+          PREFIX="$PWD/prefix"
+          CFLAGS_ARCH="-arch ${{ matrix.arch }} -mmacosx-version-min=11.0"
+          curl -fsSLO "https://downloads.sourceforge.net/project/lame/lame/${LAME_VERSION}/lame-${LAME_VERSION}.tar.gz"
+          curl -fsSLO "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz"
+          curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          echo "$LAME_SHA256  lame-${LAME_VERSION}.tar.gz" | shasum -a 256 -c -
+          echo "$OPUS_SHA256  opus-${OPUS_VERSION}.tar.gz" | shasum -a 256 -c -
+          echo "$FFMPEG_SHA256  ffmpeg-${FFMPEG_VERSION}.tar.xz" | shasum -a 256 -c -
+          tar xf lame-${LAME_VERSION}.tar.gz
+          (cd lame-${LAME_VERSION} && CFLAGS="$CFLAGS_ARCH" ./configure --prefix="$PREFIX" --disable-shared --enable-static --disable-frontend --host=$( [ "${{ matrix.arch }}" = arm64 ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin ) && make -j4 && make install)
+          tar xf opus-${OPUS_VERSION}.tar.gz
+          (cd opus-${OPUS_VERSION} && CFLAGS="$CFLAGS_ARCH" ./configure --prefix="$PREFIX" --disable-shared --enable-static --disable-doc --disable-extra-programs && make -j4 && make install)
+          tar xf ffmpeg-${FFMPEG_VERSION}.tar.xz
+          cd ffmpeg-${FFMPEG_VERSION}
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
+            --prefix="$PWD/../ff" --arch=${{ matrix.arch }} \
+            --extra-cflags="-I$PREFIX/include $CFLAGS_ARCH" --extra-ldflags="-L$PREFIX/lib $CFLAGS_ARCH" \
+            --disable-gpl --disable-nonfree --disable-debug --disable-doc --disable-ffplay \
+            --enable-libmp3lame --enable-libopus --enable-pic
+          make -j4
+          cp ffmpeg ffprobe ../../out/
+      - name: Verify LGPL and codecs
+        run: |
+          set -eux
+          chmod +x out/ffmpeg out/ffprobe
+          out/ffmpeg -version | tee v.txt
+          if grep -e '--enable-gpl' -e '--enable-nonfree' v.txt; then echo "GPL/nonfree build" >&2; exit 1; fi
+          out/ffmpeg -encoders | grep -E 'libmp3lame|libopus'
+          for b in out/ffmpeg out/ffprobe; do
+            otool -L "$b" | tail -n +2 | awk '{print $1}' | tee libs.txt
+            if grep -vE '^(/usr/lib/|/System/)' libs.txt; then echo "non-system dylib linked in $b" >&2; exit 1; fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.triple }}
+          path: out/
+          if-no-files-found: error

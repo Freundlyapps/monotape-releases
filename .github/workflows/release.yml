@@ -1,0 +1,146 @@
+# Builds Monotape's installers from the private source repo and attaches them to a DRAFT release
+# here. Runs only when started by hand (Actions > release > Run workflow), which needs write access
+# to this repo. Public repos get GitHub's runners for free; the source repo stays private.
+#
+# Secrets (this repo > Settings > Secrets and variables > Actions):
+#   SOURCE_REPO_TOKEN                   fine-grained PAT, read-only Contents on Freundlyapps/monotape
+#   TAURI_SIGNING_PRIVATE_KEY           contents of the updater private key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password (may be empty)
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.0 (must match the version in the source)"
+        required: true
+      source_ref:
+        description: "Branch, tag or commit of Freundlyapps/monotape to build"
+        required: true
+        default: main
+      publish:
+        description: "Publish when all installers are present (leave off to keep a private draft)"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  SOURCE_REPO: Freundlyapps/monotape
+jobs:
+  ffmpeg-macos:
+    uses: ./.github/workflows/build-ffmpeg-macos.yml
+
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3" >&2; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; delete it first" >&2; exit 1
+          fi
+          # Draft: invisible to /releases/latest (the in-app updater and landing page) until published.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Monotape $TAG" \
+            --notes "Unsigned build. Windows: SmartScreen > More info > Run anyway. macOS: right-click > Open." >/dev/null
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" --jq ".[] | select(.tag_name==\"$TAG\" and .draft) | .id" | head -n1)
+          test -n "$id"
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [create-release, ffmpeg-macos]
+    strategy:
+      fail-fast: true
+      # Serial: each job merges its platform into the release's latest.json; parallel uploads would race.
+      max-parallel: 1
+      matrix:
+        include:
+          - { runner: windows-latest, triple: x86_64-pc-windows-msvc }
+          - { runner: macos-14, triple: aarch64-apple-darwin }
+          - { runner: macos-15-intel, triple: x86_64-apple-darwin }   # native build, no cross-compile
+          - { runner: ubuntu-22.04, triple: x86_64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Version matches the tag
+        shell: bash
+        run: |
+          v=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          [ "v$v" = "${{ inputs.tag }}" ] || { echo "source is v$v, tag is ${{ inputs.tag }}" >&2; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.triple }}
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf unzip
+      - name: Download macOS ffmpeg artifact
+        if: runner.os == 'macOS'
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.triple }}
+          path: ffmpeg-dir
+      - run: npm ci
+      - name: Fetch sidecar binaries
+        if: runner.os != 'macOS'
+        run: node scripts/fetch-binaries.mjs --target ${{ matrix.triple }}
+      - name: Fetch sidecar binaries (macOS)
+        if: runner.os == 'macOS'
+        run: node scripts/fetch-binaries.mjs --target ${{ matrix.triple }} --ffmpeg-dir ffmpeg-dir
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          releaseDraft: true
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --target ${{ matrix.triple }}
+
+  check:
+    needs: [create-release, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.create-release.outputs.release_id }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          names=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID" --jq '.assets[].name')
+          echo "$names"
+          echo "$names" | grep -qx latest.json || { echo "latest.json missing" >&2; exit 1; }
+          for pat in '_x64-setup\.exe$' '_aarch64\.dmg$' '_x64\.dmg$' '_amd64\.AppImage$' '_amd64\.deb$'; do
+            echo "$names" | grep -qE "$pat" || { echo "missing asset $pat" >&2; exit 1; }
+          done
+          if [ "$PUBLISH" = "true" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -f make_latest=true >/dev/null
+            echo "published"
+          else
+            echo "all installers present; the release stays a draft until you publish it"
+          fi
